@@ -13,69 +13,69 @@ async function crawlNovel(startUrl) {
     try {
         console.log(`Starting crawl for URL: ${startUrl}`);
 
+        // Normalize URL
         if (!startUrl.startsWith('http')) {
             startUrl = `https://${startUrl}`;
         }
 
         const novelIdMatch = startUrl.match(/\/read\/(\d+)/);
-        if (!novelIdMatch) throw new Error('Invalid URL format');
+        if (!novelIdMatch) throw new Error('Invalid URL format: must contain /read/ followed by digits');
         const novelId = novelIdMatch[1];
 
         const baseUrl = new URL(startUrl).origin;
         const axiosInstance = axios.create({
-            timeout: 10000,
+            timeout: 15000,
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Accept-Language': 'en-US,en;q=0.9',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+                'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Connection': 'keep-alive'
             }
         });
 
-        // === STEP 1: Fetch main novel page to extract metadata ===
-        const mainNovelPageUrl = `${baseUrl}/book/${novelId}/`; // Adjust if needed based on site structure
-        const mainPageRes = await axiosInstance.get(mainNovelPageUrl);
-        const $main = cheerio.load(mainPageRes.data);
+        // === FETCH THE MAIN PAGE (which contains both metadata AND chapter list) ===
+        console.log('Fetching novel page for metadata and chapter list...');
+        const mainPageResponse = await axiosInstance.get(startUrl);
+        const $main = cheerio.load(mainPageResponse.data);
 
-        // Extract metadata
+        // --- Extract Metadata ---
         const novelTitle = $main('.n-text h1').first().text().trim() || 'Untitled';
         const cover = $main('.n-img img').attr('src') || '';
         const author = $main('.n-text p a.bauthor').first().text().trim() || 'Unknown';
-        const authorUrlEl = $main('.n-text p a.bauthor').first().attr('href');
-        const authorUrl = authorUrlEl ? new URL(authorUrlEl, mainNovelPageUrl).href : null;
+
+        const authorUrlEl = $main('.n-text p a.bauthor').attr('href');
+        const authorUrl = authorUrlEl ? new URL(authorUrlEl, startUrl).href : null;
 
         let status = 'Unknown';
-        const lzText = $main('.n-text p .lz').text().trim();
-        const endText = $main('.n-text p .end').text().trim();
-        if (lzText) status = lzText;
-        else if (endText) status = endText;
+        if ($main('.n-text p .lz').length) {
+            status = $main('.n-text p .lz').text().trim();
+        } else if ($main('.n-text p .end').length) {
+            status = $main('.n-text p .end').text().trim();
+        }
 
         const description = $main('#intro').text().trim() || '';
 
         const genres = [];
         $main('.tags em a').each((_, el) => {
-            const genre = $main(el).text().trim();
-            if (genre) genres.push(genre);
+            const tag = $main(el).text().trim();
+            if (tag) genres.push(tag);
         });
 
-        // === STEP 2: Get latest chapter number from chapter list ===
-        const chapterListPageUrl = startUrl; // assuming startUrl is the chapter list
-        const chapterListRes = await axiosInstance.get(chapterListPageUrl);
-        const $chapters = cheerio.load(chapterListRes.data);
-        const lastLink = $chapters('.u-chapter.cfirst li a').last(); // last <a> in list
-        if (!lastLink.length) throw new Error("Couldn't find last chapter link");
+        // --- Extract latest chapter number ---
+        const latestChapterUrl = $main('ul.u-chapter.cfirst li a').first().attr('href');
+        if (!latestChapterUrl) throw new Error('Could not find any chapter links');
+        const latestChapterMatch = latestChapterUrl.match(/p(\d+)\.html/);
+        if (!latestChapterMatch) throw new Error('Could not extract chapter number from URL');
+        const latestChapter = parseInt(latestChapterMatch[1], 10);
 
-        const href = lastLink.attr('href');
-        const match = href.match(/p(\d+)\.html$/);
-        if (!match) throw new Error("Couldn't extract last chapter number");
-        const latestChapter = parseInt(match[1], 10);
-
-        // === STEP 3: Generate chapter URLs ===
+        // Generate chapter URLs from 1 to latestChapter (but download from latest → 1)
         const chapterUrls = Array.from({ length: latestChapter }, (_, i) =>
             `${baseUrl}/read/${novelId}/p${latestChapter - i}.html`
         );
 
-        console.log(`Found ${chapterUrls.length} chapters to download`);
+        console.log(`Found ${chapterUrls.length} chapters. Novel: "${novelTitle}" by ${author}`);
 
-        // === STEP 4: Prepare output directory ===
+        // --- Prepare output directory ---
         const resultDir = path.join(__dirname, '../results');
         if (!fs.existsSync(resultDir)) {
             await mkdir(resultDir, { recursive: true });
@@ -84,7 +84,7 @@ async function crawlNovel(startUrl) {
         const outputFile = path.join(resultDir, `${novelId}.json`);
         const chapters = [];
 
-        // === STEP 5: Download chapters in parallel ===
+        // --- Download chapters ---
         const queue = new PQueue({ concurrency: 25 });
         let completed = 0;
 
@@ -92,7 +92,7 @@ async function crawlNovel(startUrl) {
             process.stdout.write(`\rDownloading: ${completed}/${chapterUrls.length} chapters`);
         };
 
-        console.log('Starting downloads...');
+        console.log('Starting chapter downloads...');
         updateProgress();
 
         await Promise.all(chapterUrls.map((url, index) =>
@@ -101,23 +101,23 @@ async function crawlNovel(startUrl) {
                     const response = await axiosInstance.get(url);
                     const $ = cheerio.load(response.data);
 
-                    $('script, style, iframe, noscript, p.abg, .ad, .ads').remove();
+                    // Clean unwanted elements
+                    $('script, style, iframe, noscript, p.abg, .ad, .ads, .hidden').remove();
 
                     let title = $('article.page-content > h3').text().trim();
                     let content = $('article.page-content section p')
                         .map((_, el) => $(el).text().trim().replace(/https?:\/\/[^\s]+/g, ''))
                         .get()
+                        .filter(text => text.length > 0) // remove empty lines
                         .join('\n\n');
 
                     const chapterNumber = chapterUrls.length - index;
 
                     if (!title && !content) {
-                        return; // skip
-                    } else if (!content) {
-                        content = "Chapter is missing";
-                    } else if (!title) {
-                        title = "Empty";
+                        return; // skip empty
                     }
+                    if (!content) content = "Chapter is missing";
+                    if (!title) title = "Empty";
 
                     chapters[chapterUrls.length - 1 - index] = {
                         title: title || `Chapter ${chapterNumber}`,
@@ -134,9 +134,9 @@ async function crawlNovel(startUrl) {
 
         const filteredChapters = chapters.filter(ch => ch !== undefined);
 
-        // === STEP 6: Assemble final output with metadata ===
+        // --- Final output with metadata ---
         const finalOutput = {
-            metadata: {
+            meta: {
                 id: novelId,
                 title: novelTitle,
                 cover,
@@ -146,26 +146,27 @@ async function crawlNovel(startUrl) {
                 description,
                 genres,
                 totalChapters: filteredChapters.length,
-                sourceUrl: mainNovelPageUrl
+                sourceUrl: startUrl
             },
             chapters: filteredChapters
         };
 
         console.log('\n');
-        await writeFile(outputFile, JSON.stringify(finalOutput, null, 2));
-        console.log(`Saved ${filteredChapters.length} chapters + metadata to ${outputFile}`);
+        await writeFile(outputFile, JSON.stringify(finalOutput, null, 2), 'utf8');
+        console.log(`✅ Saved ${filteredChapters.length} chapters + metadata to ${outputFile}`);
 
         return outputFile;
     } catch (error) {
-        console.error('\nCrawl failed:', error.message);
+        console.error('\n❌ Crawl failed:', error.message);
         throw error;
     }
 }
 
-// Run
+// --- Run ---
 const url = process.argv[2] || process.env.INPUT_URL;
 if (!url) {
-    console.error('Please provide a URL');
+    console.error('Usage: node crawler.js <novel-url>');
+    console.error('Example: node crawler.js https://ixdzs.tw/read/620883/');
     process.exit(1);
 }
 
