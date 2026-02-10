@@ -29,7 +29,7 @@ jobs:
       run: npm install
       
     - name: Run crawler
-      run: node script/script.js "${{ github.event.inputs.url }}"
+      run: node script/script1.js "${{ github.event.inputs.url }}"
         
     - name: Commit and push results
       run: |
