@@ -1,0 +1,81 @@
+name: Novel Crawler
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL to crawl'
+        required: true
+      translate:
+        description: 'Translate to English (true/false)'
+        required: false
+        default: 'false'
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Needed to push changes back
+        
+    - name: Clear results folder
+      run: rm -rf results || true
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        
+    - name: Install dependencies
+      run: npm install
+      
+    - name: Install Puppeteer system dependencies
+      if: ${{ github.event.inputs.translate == 'true' }}
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libgbm-dev \
+          libxshmfence-dev \
+          libasound2 \
+          libatk-bridge2.0-0 \
+          libgtk-3-0 \
+          libnss3 \
+          libxss1 \
+          libxtst6 \
+          xdg-utils \
+          libdrm2 \
+          libx11-xcb1 \
+          libxcomposite1 \
+          libxcursor1 \
+          libxdamage1 \
+          libxi6 \
+          libxtst6 \
+          libxrandr2 \
+          libxrender1 \
+          libcairo2 \
+          libpango-1.0-0 \
+          libatk1.0-0 \
+          libatspi2.0-0 \
+          fonts-noto-cjk  # For Chinese character support
+
+    - name: Run crawler (without translation)
+      if: ${{ github.event.inputs.translate != 'true' }}
+      run: node script/script2.js "${{ github.event.inputs.url }}"
+      
+    - name: Run crawler with translation
+      if: ${{ github.event.inputs.translate == 'true' }}
+      run: node script/script2.js "${{ github.event.inputs.url }}" translate
+      env:
+        PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 'false'
+        
+    - name: Commit and push results
+      run: |
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        mkdir -p results  # Ensure dir exists even if empty
+        git add results
+        git commit -m "Updated novel crawl results - URL: ${{ github.event.inputs.url }}${{ github.event.inputs.translate == 'true' && ' (Translated)' || '' }}" || echo "No changes to commit"
+        git push
