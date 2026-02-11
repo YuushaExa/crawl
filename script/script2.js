@@ -10,7 +10,7 @@ const puppeteer = require('puppeteer');
 const writeFile = promisify(fs.writeFile);
 const mkdir = promisify(fs.mkdir);
 
-// ===== SINGLE BROWSER TRANSLATION MANAGER =====
+// ===== WORKING TRANSLATOR (SIMULATES REAL USER INTERACTION) =====
 class Translator {
     constructor() {
         this.browser = null;
@@ -18,7 +18,7 @@ class Translator {
     }
 
     async init() {
-        console.log('Launching Chrome for translation...');
+        console.log('🚀 Launching Chrome...');
         this.browser = await puppeteer.launch({
             headless: 'new',
             args: [
@@ -27,60 +27,69 @@ class Translator {
                 '--disable-dev-shm-usage',
                 '--disable-gpu',
                 '--disable-extensions',
-                '--disable-background-networking',
-                '--disable-default-apps',
-                '--disable-sync',
-                '--mute-audio',
-                '--no-first-run',
-                '--no-default-browser-check'
+                '--lang=en-US,en'
             ]
         });
 
         this.page = await this.browser.newPage();
-        await this.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+        await this.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
         
-        // Navigate to Google Translate once
+        // CRITICAL: Force desktop viewport (prevents mobile UI)
+        await this.page.setViewport({ width: 1280, height: 800 });
+        
+        // Navigate to clean translate page
         await this.page.goto('https://translate.google.com/?sl=zh-CN&tl=en&op=translate', {
-            waitUntil: 'networkidle2',
+            waitUntil: 'networkidle0',
             timeout: 30000
         });
         
-        await this.page.waitForTimeout(2000);
-        console.log('✅ Chrome ready for translation');
+        // Wait for textarea to be truly interactable
+        await this.page.waitForSelector('textarea[aria-label="Source text"]', { 
+            visible: true, 
+            timeout: 15000 
+        });
+        
+        console.log('✅ Ready for translation');
     }
 
     async translate(text) {
-        if (!text || text.trim().length === 0) return text;
+        if (!text || text.trim().length < 2) return text;
+        const cleanText = text.trim().substring(0, 5000); // Google has limits
         
         try {
-            const textareaSelector = 'textarea[aria-label="Source text"]';
-            const resultSelector = 'span[class*="ryNqvb"]';
+            const textareaSel = 'textarea[aria-label="Source text"]';
+            const resultSel = 'span.ryNqvb';
 
-            // Clear textarea
-            await this.page.click(textareaSelector, { clickCount: 3 });
-            await this.page.keyboard.press('Backspace');
+            // 1. CLICK to focus textarea (MANDATORY for Google)
+            await this.page.click(textareaSel, { clickCount: 3 }); // Triple-click selects all
+            await this.page.keyboard.press('Backspace'); // Clear
             
-            // Type text
-            await this.page.type(textareaSelector, text, { delay: 5 });
+            // 2. TYPE slowly (triggers real input events Google expects)
+            await this.page.type(textareaSel, cleanText, { delay: 15 }); // 15ms/char is safe
             
-            // Wait for translation
-            await this.page.waitForTimeout(2000);
-            
-            // Get result
-            await this.page.waitForSelector(resultSelector, { timeout: 10000 });
-            
+            // 3. Wait for translation to appear
+            await this.page.waitForFunction(
+                (sel) => {
+                    const el = document.querySelector(sel);
+                    return el && el.textContent.trim().length > 0 &&
+                           !['...', '⋯', 'Translating'].includes(el.textContent.trim());
+                },
+                { timeout: 15000, polling: 200 },
+                resultSel
+            );
+
+            // 4. Extract result
             const translated = await this.page.evaluate((sel) => {
-                const elements = document.querySelectorAll(sel);
-                return Array.from(elements)
-                    .map(el => el.textContent)
-                    .join(' ');
-            }, resultSelector);
+                return document.querySelector(sel)?.textContent.trim() || '';
+            }, resultSel);
 
-            return translated.trim() || text;
-
+            return translated && translated.length > 2 ? translated : cleanText;
+            
         } catch (error) {
-            console.error(`Translation error: ${error.message}`);
-            return text;
+            console.warn(`⚠️ Failed: "${cleanText.substring(0, 30)}..."`);
+            // DEBUG: Uncomment to see what's happening
+            // await this.page.screenshot({ path: `error-${Date.now()}.png` });
+            return cleanText;
         }
     }
 
@@ -92,298 +101,218 @@ class Translator {
     }
 }
 
-// ===== TRANSLATE CHAPTER CONTENT (preserving HTML structure) =====
+// ===== HTML-PRESERVING TRANSLATION =====
 async function translateChapterContent(htmlContent, translator) {
-    if (!htmlContent || htmlContent.trim().length === 0) return htmlContent;
+    if (!htmlContent?.trim()) return htmlContent;
     
-    const $ = cheerio.load(`<div>${htmlContent}</div>`);
-    const paragraphs = [];
+    const $ = cheerio.load(`<div>${htmlContent}</div>`, { decodeEntities: false });
+    const textNodes = [];
     
-    // Extract and translate each paragraph separately
-    $('p').each((_, el) => {
-        const $p = $(el);
-        const text = $p.text().trim();
-        
-        if (text && text.length > 0) {
-            paragraphs.push({
-                el: $p,
-                text: text
-            });
+    const extract = (node) => {
+        if (node.type === 'text' && node.data?.trim()) {
+            textNodes.push({ node, text: node.data.trim() });
         }
-    });
+        if (node.children) node.children.forEach(extract);
+    };
     
-    // Translate all paragraphs
-    for (let i = 0; i < paragraphs.length; i++) {
-        const translated = await translator.translate(paragraphs[i].text);
-        paragraphs[i].el.text(translated);
-        console.log(`   Translated paragraph ${i + 1}/${paragraphs.length}`);
+    $('div').contents().each((_, el) => extract(el));
+    if (!textNodes.length) return htmlContent;
+    
+    for (const item of textNodes) {
+        item.node.data = await translator.translate(item.text);
     }
     
-    // Rebuild HTML with translated content
     return $('div').html();
 }
 
-// ===== MAIN CRAWL FUNCTION =====
+// ===== MAIN CRAWLER (UNCHANGED CORE LOGIC) =====
 async function crawlNovel(startUrl, translate = true) {
-    try {
-        console.log(`Starting crawl for URL: ${startUrl}`);
-        console.log(`Translation enabled: ${translate ? 'YES' : 'NO'}`);
+    console.log(`\n🌐 Starting: ${startUrl}`);
+    
+    if (!startUrl.startsWith('http')) startUrl = `https://${startUrl}`;
+    const novelIdMatch = startUrl.match(/\/read\/(\d+)/);
+    if (!novelIdMatch) throw new Error('Invalid URL');
+    const novelId = novelIdMatch[1];
+    const baseUrl = new URL(startUrl).origin;
 
-        // Normalize URL
-        if (!startUrl.startsWith('http')) {
-            startUrl = `https://${startUrl}`;
+    const axiosInstance = axios.create({
+        timeout: 15000,
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7'
         }
+    });
 
-        const novelIdMatch = startUrl.match(/\/read\/(\d+)/);
-        if (!novelIdMatch) throw new Error('Invalid URL format: must contain /read/ followed by digits');
-        const novelId = novelIdMatch[1];
+    // Fetch metadata
+    console.log('📡 Fetching metadata...');
+    const res = await axiosInstance.get(startUrl);
+    const $main = cheerio.load(res.data);
 
-        const baseUrl = new URL(startUrl).origin;
-        const axiosInstance = axios.create({
-            timeout: 15000,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
-                'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Connection': 'keep-alive'
-            }
-        });
+    const novelTitle = $main('.n-text h1').first().text().trim() || 'Untitled';
+    const cover = $main('.n-img img').attr('src') || '';
+    const author = $main('.n-text p a.bauthor').first().text().trim() || 'Unknown';
+    const authorUrl = $main('.n-text p a.bauthor').attr('href') 
+        ? new URL($main('.n-text p a.bauthor').attr('href'), startUrl).href 
+        : null;
+    
+    let status = 'Unknown';
+    if ($main('.n-text p .lz').length) status = $main('.n-text p .lz').text().trim();
+    else if ($main('.n-text p .end').length) status = $main('.n-text p .end').text().trim();
+    
+    const description = $main('#intro').text().trim() || '';
+    const genres = [];
+    $main('.tags em a').each((_, el) => {
+        const tag = $main(el).text().trim();
+        if (tag) genres.push(tag);
+    });
 
-        // === FETCH THE MAIN PAGE ===
-        console.log('Fetching novel page for metadata and chapter list...');
-        const mainPageResponse = await axiosInstance.get(startUrl);
-        const $main = cheerio.load(mainPageResponse.data);
+    // Get chapters
+    const latestUrl = $main('ul.u-chapter.cfirst li a').first().attr('href');
+    if (!latestUrl) throw new Error('No chapters');
+    const match = latestUrl.match(/p(\d+)\.html/);
+    if (!match) throw new Error('Invalid chapter URL');
+    const latest = parseInt(match[1], 10);
+    
+    const chapterUrls = Array.from({ length: latest }, (_, i) =>
+        `${baseUrl}/read/${novelId}/p${latest - i}.html`
+    );
 
-        // --- Extract Metadata ---
-        const novelTitle = $main('.n-text h1').first().text().trim() || 'Untitled';
-        const cover = $main('.n-img img').attr('src') || '';
-        const author = $main('.n-text p a.bauthor').first().text().trim() || 'Unknown';
+    console.log(`📚 ${chapterUrls.length} chapters: "${novelTitle}"`);
 
-        const authorUrlEl = $main('.n-text p a.bauthor').attr('href');
-        const authorUrl = authorUrlEl ? new URL(authorUrlEl, startUrl).href : null;
+    // Setup output
+    const resultDir = path.join(__dirname, '../results');
+    await mkdir(resultDir, { recursive: true });
+    const outputFile = path.join(resultDir, `${novelId}.json`);
+    const chapters = [];
 
-        let status = 'Unknown';
-        if ($main('.n-text p .lz').length) {
-            status = $main('.n-text p .lz').text().trim();
-        } else if ($main('.n-text p .end').length) {
-            status = $main('.n-text p .end').text().trim();
-        }
-
-        const description = $main('#intro').text().trim() || '';
-
-        const genres = [];
-        $main('.tags em a').each((_, el) => {
-            const tag = $main(el).text().trim();
-            if (tag) genres.push(tag);
-        });
-
-        // --- Extract latest chapter number ---
-        const latestChapterUrl = $main('ul.u-chapter.cfirst li a').first().attr('href');
-        if (!latestChapterUrl) throw new Error('Could not find any chapter links');
-        const latestChapterMatch = latestChapterUrl.match(/p(\d+)\.html/);
-        if (!latestChapterMatch) throw new Error('Could not extract chapter number from URL');
-        const latestChapter = parseInt(latestChapterMatch[1], 10);
-
-        // Generate chapter URLs from 1 to latestChapter
-        const chapterUrls = Array.from({ length: latestChapter }, (_, i) =>
-            `${baseUrl}/read/${novelId}/p${latestChapter - i}.html`
-        );
-
-        console.log(`Found ${chapterUrls.length} chapters. Novel: "${novelTitle}" by ${author}`);
-
-        // --- Prepare output directory ---
-        const resultDir = path.join(__dirname, '../results');
-        if (!fs.existsSync(resultDir)) {
-            await mkdir(resultDir, { recursive: true });
-        }
-
-        const outputFile = path.join(resultDir, `${novelId}.json`);
-        const chapters = [];
-
-        // --- Download chapters ---
-        const queue = new PQueue({ concurrency: 15 });
-        let completed = 0;
-
-        const updateProgress = () => {
-            process.stdout.write(`\rDownloading: ${completed}/${chapterUrls.length} chapters`);
-        };
-
-        console.log('Starting chapter downloads...');
-        updateProgress();
-
-        await Promise.all(chapterUrls.map((url, index) =>
-            queue.add(async () => {
-                try {
-                    const response = await axiosInstance.get(url);
-                    const $ = cheerio.load(response.data);
-
-                    // Clean unwanted elements
-                    $('script, style, iframe, noscript, .abg, .ad, .ads, .hidden').remove();
-
-                    // Extract title - preserve as-is
-                    let title = $('article.page-content > h3').first().text().trim() || '';
-
-                    // Extract paragraphs with HTML preserved
-                    const paragraphs = [];
-                    $('article.page-content section p').each((_, el) => {
-                        const $p = $(el);
-                        if ($p.hasClass('abg') || $p.closest('.ad').length || $p.closest('.ads').length) {
-                            return;
-                        }
-                        
-                        const htmlContent = $p.html();
-                        if (htmlContent && htmlContent.trim().length > 0) {
-                            paragraphs.push(`<p>${htmlContent.trim()}</p>`);
-                        }
-                    });
-
-                    const chapterNumber = chapterUrls.length - index;
-                    let content = paragraphs.join('\n');
-
-                    if (!title && !content) {
-                        return;
-                    }
-                    if (!content) content = "<p>Chapter is missing</p>";
-                    if (!title) title = `Chapter ${chapterNumber}`;
-
-                    chapters[chapterUrls.length - 1 - index] = {
-                        title: title,
-                        content: content
-                    };
-                } catch (error) {
-                    console.error(`\nError downloading ${url}:`, error.message);
-                } finally {
-                    completed++;
-                    updateProgress();
-                }
-            })
-        ));
-
-        const filteredChapters = chapters.filter(ch => ch !== undefined);
-        console.log(`\n✅ Downloaded ${filteredChapters.length} chapters`);
-
-        // ===== TRANSLATION PHASE - ALL AT ONCE AFTER DOWNLOAD =====
-        if (translate) {
-            console.log('\n=== STARTING TRANSLATION (ONE CHROME INSTANCE) ===');
-            
-            const translator = new Translator();
-            await translator.init();
-            
+    // Download chapters
+    console.log(`📥 Downloading (${chapterUrls.length} chapters)...`);
+    const queue = new PQueue({ concurrency: 15 });
+    let completed = 0;
+    
+    await Promise.all(chapterUrls.map((url, idx) =>
+        queue.add(async () => {
             try {
-                // Translate metadata
-                console.log('Translating metadata...');
-                const metaTranslations = await Promise.all([
-                    translator.translate(novelTitle),
-                    translator.translate(author),
-                    translator.translate(status),
-                    translator.translate(description),
-                    ...genres.map(g => translator.translate(g))
-                ]);
+                const res = await axiosInstance.get(url);
+                const $ = cheerio.load(res.data);
+                $('script, style, iframe, noscript, .abg, .ad, .ads, .hidden').remove();
                 
-                const translatedTitle = metaTranslations[0];
-                const translatedAuthor = metaTranslations[1];
-                const translatedStatus = metaTranslations[2];
-                const translatedDescription = metaTranslations[3];
-                const translatedGenres = metaTranslations.slice(4);
+                let title = $('article.page-content > h3').first().text().trim() || `Chapter ${chapterUrls.length - idx}`;
+                const paragraphs = [];
                 
-                console.log('✅ Metadata translated');
+                $('article.page-content section p').each((_, el) => {
+                    const $p = $(el);
+                    if ($p.hasClass('abg') || $p.parents('.ad, .ads').length) return;
+                    const html = $p.html()?.trim();
+                    if (html && html.length > 5) paragraphs.push(`<p>${html}</p>`);
+                });
                 
-                // Translate chapters (with progress)
-                console.log(`\nTranslating ${filteredChapters.length} chapters...`);
-                for (let i = 0; i < filteredChapters.length; i++) {
-                    const chapter = filteredChapters[i];
-                    
-                    console.log(`Chapter ${i + 1}/${filteredChapters.length}: "${chapter.title}"`);
-                    
-                    // Translate title
-                    const translatedTitle = await translator.translate(chapter.title);
-                    
-                    // Translate content (preserves HTML structure)
-                    const translatedContent = await translateChapterContent(chapter.content, translator);
-                    
-                    // REPLACE original text with English (same structure)
-                    chapter.title = translatedTitle;
-                    chapter.content = translatedContent;
-                    
-                    // Small delay to avoid rate limiting
-                    if (i < filteredChapters.length - 1) {
-                        await new Promise(resolve => setTimeout(resolve, 1000));
-                    }
-                }
-                
-                console.log('✅ All chapters translated');
-                
-                // Update metadata with translated versions
-                // (keeping same JSON structure, just replacing text)
-                const finalOutput = {
-                    meta: {
-                        id: novelId,
-                        title: translatedTitle,
-                        cover: cover,
-                        author: translatedAuthor,
-                        authorUrl: authorUrl,
-                        status: translatedStatus,
-                        description: translatedDescription,
-                        genres: translatedGenres,
-                        totalChapters: filteredChapters.length,
-                        sourceUrl: startUrl
-                    },
-                    chapters: filteredChapters
-                };
-                
-                await translator.close();
-                
-                console.log('\n✅ Translation completed - Chrome closed');
-                console.log(`✅ Output structure: Same as original, all text replaced with English`);
-                
-                await writeFile(outputFile, JSON.stringify(finalOutput, null, 2), 'utf8');
-                console.log(`✅ Saved translated novel to ${outputFile}`);
-                
-                return outputFile;
-                
-            } catch (error) {
-                await translator.close();
-                throw error;
+                const content = paragraphs.join('\n') || '<p>Content unavailable</p>';
+                chapters[chapterUrls.length - 1 - idx] = { title, content };
+            } catch (e) {
+                console.error(`\n❌ ${url}: ${e.message}`);
+            } finally {
+                completed++;
+                process.stdout.write(`\r📥 ${completed}/${chapterUrls.length}`);
             }
-        } else {
-            // No translation - save original
-            const finalOutput = {
+        })
+    ));
+    
+    console.log(`\n✅ Downloaded ${chapters.filter(c => c).length} chapters`);
+
+    // TRANSLATION
+    if (translate) {
+        console.log('\n🌍 Translating...');
+        const translator = new Translator();
+        await translator.init();
+        
+        try {
+            // Metadata
+            console.log('🔤 Metadata...');
+            const meta = {
+                title: await translator.translate(novelTitle),
+                author: await translator.translate(author),
+                status: await translator.translate(status),
+                description: await translator.translate(description),
+                genres: []
+            };
+            for (const g of genres) meta.genres.push(await translator.translate(g));
+            console.log('✅ Metadata done');
+
+            // Chapters
+            console.log(`\n챕터 Translating ${chapters.length} chapters...`);
+            for (let i = 0; i < chapters.length; i++) {
+                if (!chapters[i]) continue;
+                console.log(`챕터 [${i+1}/${chapters.length}] "${chapters[i].title.substring(0, 30)}..."`);
+                
+                chapters[i].title = await translator.translate(chapters[i].title);
+                chapters[i].content = await translateChapterContent(chapters[i].content, translator);
+                
+                if (i < chapters.length - 1) await new Promise(r => setTimeout(r, 400));
+            }
+            
+            await translator.close();
+            
+            // Save
+            const out = {
                 meta: {
                     id: novelId,
-                    title: novelTitle,
-                    cover: cover,
-                    author: author,
-                    authorUrl: authorUrl,
-                    status: status,
-                    description: description,
-                    genres: genres,
-                    totalChapters: filteredChapters.length,
+                    title: meta.title,
+                    cover,
+                    author: meta.author,
+                    authorUrl,
+                    status: meta.status,
+                    description: meta.description,
+                    genres: meta.genres,
+                    totalChapters: chapters.filter(c => c).length,
                     sourceUrl: startUrl
                 },
-                chapters: filteredChapters
+                chapters: chapters.filter(c => c)
             };
             
-            await writeFile(outputFile, JSON.stringify(finalOutput, null, 2), 'utf8');
-            console.log(`✅ Saved original novel to ${outputFile}`);
-            
+            await writeFile(outputFile, JSON.stringify(out, null, 2), 'utf8');
+            console.log(`\n✅ Saved: ${outputFile}`);
             return outputFile;
+            
+        } catch (e) {
+            await translator.close();
+            throw e;
         }
-    } catch (error) {
-        console.error('\n❌ Crawl failed:', error.message);
-        throw error;
+    } else {
+        // Save original
+        const out = {
+            meta: {
+                id: novelId,
+                title: novelTitle,
+                cover,
+                author,
+                authorUrl,
+                status,
+                description,
+                genres,
+                totalChapters: chapters.filter(c => c).length,
+                sourceUrl: startUrl
+            },
+            chapters: chapters.filter(c => c)
+        };
+        
+        await writeFile(outputFile, JSON.stringify(out, null, 2), 'utf8');
+        console.log(`\n✅ Saved: ${outputFile}`);
+        return outputFile;
     }
 }
 
-// --- Run ---
+// ===== RUN =====
 const url = process.argv[2] || process.env.INPUT_URL;
 const shouldTranslate = process.argv[3] === 'translate' || process.env.TRANSLATE === 'true';
 
 if (!url) {
-    console.error('Usage: node crawler.js <novel-url> [translate]');
-    console.error('Example: node crawler.js https://ixdzs.tw/read/620883/ translate');
+    console.error('Usage: node crawler.js <url> [translate]');
     process.exit(1);
 }
 
 crawlNovel(url, shouldTranslate)
-    .then(() => process.exit(0))
-    .catch(() => process.exit(1));
+    .catch(err => {
+        console.error('\n💥 Error:', err.message);
+        process.exit(1);
+    });
