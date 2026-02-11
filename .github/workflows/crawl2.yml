@@ -9,7 +9,7 @@ on:
       translate:
         description: 'Translate to English (true/false)'
         required: false
-        default: 'true'
+        default: 'false'
 
 jobs:
   crawl:
@@ -32,26 +32,18 @@ jobs:
     - name: Install Node.js dependencies
       run: npm install
       
-    - name: Install Puppeteer dependencies (only if translating)
+    - name: Install minimal Puppeteer dependencies (only if translating)
       if: ${{ github.event.inputs.translate == 'true' }}
       run: |
-        # Minimal required dependencies for headless Chrome on GitHub Actions
-        sudo apt-get update -qq
+        # Only 2 packages are REQUIRED for headless Chromium on GitHub Actions
+        sudo apt-get update -qq 2>/dev/null || true
         sudo apt-get install -y -qq --no-install-recommends \
           libgbm-dev \
           libxshmfence-dev \
-          libasound2 \
-          libatk-bridge2.0-0 \
-          libgtk-3-0 \
-          libnss3 \
-          libxss1 \
-          libxtst6 \
-          xdg-utils \
-          libatspi2.0-0 \
-          fonts-noto-cjk
+        || echo "Warning: Some dependencies failed to install (usually OK)"
         
-        # Verify installation
-        google-chrome --version || echo "Chrome not installed (using Puppeteer's bundled version)"
+        # Optional: Install Chinese fonts for better rendering (non-critical)
+        sudo apt-get install -y -qq fonts-noto-cjk 2>/dev/null || true
 
     - name: Run crawler (without translation)
       if: ${{ github.event.inputs.translate != 'true' }}
@@ -61,15 +53,18 @@ jobs:
       if: ${{ github.event.inputs.translate == 'true' }}
       run: node script/script2.js "${{ github.event.inputs.url }}" translate
       env:
+        # Critical: Use Puppeteer's bundled Chromium (no system Chrome needed)
         PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 'false'
-        # Important: Use Puppeteer's bundled Chromium instead of system Chrome
-        PUPPETEER_EXECUTABLE_PATH: '/usr/bin/chromium-browser'
 
     - name: Commit and push results
       run: |
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
         mkdir -p results
-        git add results/
-        git diff --quiet --cached || git commit -m "Updated novel crawl results - URL: ${{ github.event.inputs.url }}${{ github.event.inputs.translate == 'true' && ' (Translated to English)' || '' }}"
-        git push || echo "Nothing to push"
+        git add results/ 2>/dev/null || true
+        if git diff --quiet --cached; then
+          echo "No changes to commit"
+        else
+          git commit -m "Updated novel crawl results - URL: ${{ github.event.inputs.url }}${{ github.event.inputs.translate == 'true' && ' (Translated to English)' || '' }}"
+          git push
+        fi
