@@ -10,7 +10,7 @@ const puppeteer = require('puppeteer');
 const writeFile = promisify(fs.writeFile);
 const mkdir = promisify(fs.mkdir);
 
-// ===== ROBUST TRANSLATOR (WORKS WITH CURRENT GOOGLE UI) =====
+// ===== FIXED TRANSLATOR (CORRECT SELECTORS) =====
 class Translator {
     constructor() {
         this.browser = null;
@@ -33,14 +33,13 @@ class Translator {
         this.page = await this.browser.newPage();
         await this.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
         
-        // CRITICAL: Use modern Google Translate URL format
-        await this.page.goto('https://translate.google.com/?sl=zh-CN&tl=en&text=&op=translate', {
+        await this.page.goto('https://translate.google.com/?sl=zh-CN&tl=en&op=translate', {
             waitUntil: 'networkidle0',
             timeout: 30000
         });
         
-        // Wait for input field to be truly ready (modern UI uses contenteditable divs)
-        await this.page.waitForSelector('div[contenteditable="true"]', { timeout: 15000 });
+        // Wait for textarea to be ready
+        await this.page.waitForSelector('textarea[aria-label="Source text"]', { timeout: 15000 });
         console.log('✅ Translation engine ready');
     }
 
@@ -49,45 +48,50 @@ class Translator {
         const cleanText = text.trim();
         
         try {
-            // 1. CLEAR INPUT (modern UI uses contenteditable divs)
-            await this.page.evaluate(() => {
-                const el = document.querySelector('div[contenteditable="true"]');
+            // ===== INPUT: textarea with aria-label =====
+            const textareaSel = 'textarea[aria-label="Source text"]';
+            const outputSel = 'span.ryNqvb'; // Direct class selector (faster)
+
+            // Clear textarea
+            await this.page.evaluate((sel) => {
+                const el = document.querySelector(sel);
                 if (el) {
-                    el.innerHTML = '';
+                    el.value = '';
                     el.dispatchEvent(new Event('input', { bubbles: true }));
                 }
-            });
+            }, textareaSel);
 
-            // 2. SET TEXT INSTANTLY (no typing delay)
-            await this.page.evaluate((val) => {
-                const el = document.querySelector('div[contenteditable="true"]');
+            // Set text instantly
+            await this.page.evaluate((sel, val) => {
+                const el = document.querySelector(sel);
                 if (el) {
-                    el.textContent = val;
+                    el.value = val;
                     el.dispatchEvent(new Event('input', { bubbles: true }));
                 }
-            }, cleanText);
+            }, textareaSel, cleanText);
 
-            // 3. WAIT FOR TRANSLATION TO APPEAR (smart polling)
-            await this.page.waitForFunction(() => {
-                const result = document.querySelector('span[data-language-for-alternatives="en"]');
-                return result && result.textContent.trim().length > 0 && 
-                       !result.textContent.includes('Translating') &&
-                       !result.textContent.includes('...');
-            }, { timeout: 10000, polling: 200 });
+            // Wait for translation to appear
+            await this.page.waitForFunction(
+                (sel) => {
+                    const el = document.querySelector(sel);
+                    return el && el.textContent.trim().length > 0 &&
+                           !el.textContent.includes('...');
+                },
+                { timeout: 12000, polling: 150 },
+                outputSel
+            );
 
-            // 4. EXTRACT TRANSLATION
-            const translated = await this.page.evaluate(() => {
-                const el = document.querySelector('span[data-language-for-alternatives="en"]');
+            // Extract translation
+            const translated = await this.page.evaluate((sel) => {
+                const el = document.querySelector(sel);
                 return el ? el.textContent.trim() : '';
-            });
+            }, outputSel);
 
             return translated && translated !== cleanText ? translated : cleanText;
             
         } catch (error) {
-            console.warn(`⚠️ Translation failed for: "${cleanText.substring(0, 30)}..."`);
-            // DEBUG: Uncomment to see page state on failure
-            // await this.page.screenshot({ path: `debug-${Date.now()}.png` });
-            return cleanText; // Fallback to original
+            console.warn(`⚠️ Translation failed: "${cleanText.substring(0, 30)}..."`);
+            return cleanText;
         }
     }
 
@@ -106,7 +110,6 @@ async function translateChapterContent(htmlContent, translator) {
     const $ = cheerio.load(`<div>${htmlContent}</div>`, { decodeEntities: false });
     const textNodes = [];
     
-    // Extract all text nodes while preserving HTML structure
     const extractTextNodes = (node) => {
         if (node.type === 'text' && node.data?.trim()) {
             textNodes.push({ node, original: node.data.trim() });
@@ -120,7 +123,6 @@ async function translateChapterContent(htmlContent, translator) {
     
     if (textNodes.length === 0) return htmlContent;
     
-    // Translate text nodes sequentially
     for (const item of textNodes) {
         item.node.data = await translator.translate(item.original);
     }
@@ -231,7 +233,7 @@ async function crawlNovel(startUrl, translate = true) {
         await translator.init();
         
         try {
-            // Translate metadata sequentially
+            // Translate metadata
             console.log('🔤 Translating metadata...');
             const meta = {
                 title: await translator.translate(novelTitle),
@@ -257,7 +259,6 @@ async function crawlNovel(startUrl, translate = true) {
                 chapter.title = await translator.translate(chapter.title);
                 chapter.content = await translateChapterContent(chapter.content, translator);
                 
-                // Small delay to avoid rate limiting
                 if (i < chapters.length - 1) {
                     await new Promise(res => setTimeout(res, 300));
                 }
